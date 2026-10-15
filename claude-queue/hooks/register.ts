@@ -38,7 +38,7 @@ const TRUST_STOP_MS = 60_000
 const FOCUS_TRIES = 6
 const FOCUS_MS = 60
 
-type Entry = { id: string; text: string }
+type Entry = { id: string; text: string; at: number }
 
 let stack: Entry[] = []
 /** taken out of the stack by `[ ▶ ]` to ride the running turn's next tool result */
@@ -223,7 +223,7 @@ const gate = async ($: EngineInterface) => {
   // probe ends the wait)
   if (lastUnknown && ++unknowns >= UNKNOWN_GIVE_UP) {
     unknowns = 0
-    $.ui.log('queue: the tasks answer never made sense · sending; report the lines above')
+    $.ui.log('queue: the tasks answer never made sense · sending anyway')
     return void flush($)
   }
   if (!lastUnknown) unknowns = 0
@@ -262,6 +262,30 @@ const classifyTasks = (text: string): boolean | undefined => {
   if (body === '' || /^\W*no\b.{0,20}\btasks?\b/i.test(body)) return false
   if (/\brunning\b|in the background|waiting|monitor/i.test(body)) return true
   return undefined
+}
+
+/** how old a held entry may be for its bare text to read as a queued echo */
+const ECHO_WINDOW_MS = 5 * 60_000
+
+// Some surfaces (seen on the desktop Code tab) queue the typed `/q <text>`
+// line into the engine's own mid-turn message queue as well as running the
+// command: the model then reads the raw line, and the stack's copy goes out
+// again at idle. Drop those echoes silently: the queue and the band already
+// say what is held, and the held copy arriving at idle is the whole story.
+const isEcho = (raw: string): boolean => {
+  const line = raw.trim()
+  if (line === '') return false
+  const stripped = line.replace(/^\/q\b/, '').trim()
+  if (stripped !== line) {
+    // the whole typed command, slash included: match it against the stack at
+    // any age, and never against the plugin's own submit (its entry is
+    // already out of the stack when $.prompt.submit runs)
+    return stripped !== '' && stack.some(entry => entry.text.trim() === stripped)
+  }
+  // the bare text, queued without its command prefix: only a fresh held
+  // entry counts, so the plugin's own submit (taken out before sending)
+  // and an ordinary prompt pass through
+  return stack.some(entry => entry.at > Date.now() - ECHO_WINDOW_MS && entry.text.trim() === line)
 }
 
 // out of the stack only once the box has it: a fill the box turned down (a
@@ -579,8 +603,11 @@ export const register: Register = (on, options) => {
   })
 
   // Enter is left to the engine. Only the turn id is read off it: a reload
-  // mid-turn missed turn.start, and this Enter carries the id it lost.
+  // mid-turn missed turn.start, and this Enter carries the id it lost. The
+  // one exception is a queued echo of a held `/q` line, dropped so the stack
+  // drains once, at idle, instead of the raw text arriving early as well.
   on('prompt.submit', async ($, e, next) => {
+    if (isEcho((e as { text?: string }).text ?? '')) return { drop: 'prompt-queue' }
     if (e.turnId) turnId = e.turnId
     return next(e)
   })
@@ -648,7 +675,7 @@ export const register: Register = (on, options) => {
     }
     if (word === 'help') return { text: 'queue: /q <text> · up <n> · down <n> · mv <n> <m> · now <n> · rm <n> · edit <n> · clear · send · status' }
     // anything else is the prompt to hold
-    stack.push({ id: `e${++counter}`, text: e.args.trim() })
+    stack.push({ id: `e${++counter}`, text: e.args.trim(), at: Date.now() })
     $.ui.invalidate('ui.render')
     if (turnId) return { text: `queue: held · ${stack.length} waiting · sent when the turn ends` }
     if (inFlight > 0) return { text: `queue: held · ${stack.length} waiting · sent when the background work ends` }
