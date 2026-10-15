@@ -1,6 +1,6 @@
 {
   "name": "prompt-queue",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "private": true,
   "type": "module",
   "description": "Claude Code mod: prompts typed mid-turn wait in a stack above the prompt and go out when the turn ends",

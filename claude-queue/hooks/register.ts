@@ -23,6 +23,17 @@ const GAP_MS = 5200
 const CONTEXT_MAX = 32000
 /** refusals in a row before the drain stops and waits for /q send */
 const RETRIES = 3
+/** how long a live /tasks answer is trusted */
+const BUSY_CACHE_MS = 2000
+/** the wait between probes while the engine reports work running (long: each
+    probe runs /tasks like the user typed it, and a slow poll still catches
+    the drain at turn boundaries and task-notifications anyway) */
+const PROBE_RETRY_MS = 10_000
+/** unclassifiable probes in a row before the drain trusts a clear Stop answer
+    instead — it punishes a broken classifier, never genuinely running work */
+const UNKNOWN_GIVE_UP = 3
+/** how recent a Stop that named its background tasks must be to answer for the engine */
+const TRUST_STOP_MS = 60_000
 /** tries, and the wait between them, for the ring to reach a field just drawn */
 const FOCUS_TRIES = 6
 const FOCUS_MS = 60
@@ -53,6 +64,18 @@ let bandRequest: string | undefined
 let fullscreen: boolean | undefined
 /** the engine's count of background work (subagents, shells, monitors) still running at the last Stop */
 let inFlight = 0
+/** the last Stop came without background_tasks at all: its silence is not an empty list */
+let stopBlind = false
+/** when the last Stop answered with a real background_tasks array */
+let stopAt = 0
+/** a live /tasks answer, kept for a beat so a burst of drain decisions asks once */
+let busyCache: { at: number; running: boolean } | null = null
+/** unclassifiable probes in a row, for the give-up backstop */
+let unknowns = 0
+/** whether the answer behind the current busy verdict was unclassifiable */
+let lastUnknown = false
+/** a gate verdict is in flight between its arming and its answer */
+let gating = false
 
 const firstLine = (text: string) => text.trim().split('\n')[0]?.trim() ?? ''
 
@@ -81,7 +104,7 @@ const state = (): [word: string, moving: boolean] =>
 
 /** one line for a "it did not send" report: every flag the drain reads */
 const statusLine = () =>
-  `turn ${turnId ? 'running' : 'idle'}${inFlight > 0 ? ` · ${inFlight} in the background` : ''} · ${stack.length} held${steer.length > 0 ? ` · ${steer.length} going into the turn` : ''} · ${pending && !turnId ? 'going out' : 'waiting'}`
+  `turn ${turnId ? 'running' : 'idle'}${inFlight > 0 ? ` · ${inFlight} in the background` : stopBlind ? ' · background unknown' : ''} · ${stack.length} held${steer.length > 0 ? ` · ${steer.length} going into the turn` : ''} · ${pending && !turnId ? 'going out' : 'waiting'}`
 
 const indexOfId = (id: string) => stack.findIndex(entry => entry.id === id)
 
@@ -169,7 +192,76 @@ const flush = ($: EngineInterface) => {
 // or ui.render is refused, as it would wait on the turn that hook holds.
 const send = ($: EngineInterface) => {
   failures = 0
-  if (!pending) pending = $.clock.after(0, () => flush($))
+  armGate($)
+}
+
+// Only one gate runs at a time, whatever raises it.
+const armGate = ($: EngineInterface) => {
+  if (pending || gating) return
+  pending = $.clock.after(0, () => gate($))
+}
+
+// The Stop snapshot is the only background count the mod holds, and it can
+// lie: a Ctrl+B move can race past it, and a surface that omits
+// background_tasks reads as an engine with nothing running. Before anything
+// leaves the stack on a count of zero, ask the engine live.
+const gate = async ($: EngineInterface) => {
+  pending = null
+  if (stack.length === 0 || turnId) return
+  gating = true
+  let running: boolean
+  try {
+    running = inFlight > 0 || (await backgroundRunning($))
+  } catch {
+    running = false
+  } finally {
+    gating = false
+  }
+  if (!running) return void flush($)
+  // only a classifier that never makes sense gets overruled; genuinely running
+  // work is waited out however long it takes (a turn boundary or a clear
+  // probe ends the wait)
+  if (lastUnknown && ++unknowns >= UNKNOWN_GIVE_UP) {
+    unknowns = 0
+    $.ui.log('queue: the tasks answer never made sense · sending; report the lines above')
+    return void flush($)
+  }
+  if (!lastUnknown) unknowns = 0
+  pending = $.clock.after(PROBE_RETRY_MS, () => gate($))
+  $.ui.invalidate('ui.render')
+}
+
+const backgroundRunning = async ($: EngineInterface): Promise<boolean> => {
+  lastUnknown = false
+  if (busyCache && Date.now() - busyCache.at < BUSY_CACHE_MS) return busyCache.running
+  let running: boolean
+  try {
+    const r = (await $.command.run({ command: 'tasks', args: '' })) as { text?: string } | undefined
+    const text = r?.text ?? ''
+    const verdict = classifyTasks(text)
+    if (verdict !== undefined) running = verdict
+    else if (!stopBlind && Date.now() - stopAt < TRUST_STOP_MS) running = false
+    else {
+      // no usable answer and no recent trustworthy Stop: hold the queue and
+      // tell on itself, so a format change becomes a logged, reportable pause
+      // instead of either a premature send or a silent wedge
+      lastUnknown = true
+      running = true
+      $.ui.log(`queue: cannot read the tasks answer · treating as busy: ${JSON.stringify(text.slice(0, 200))}`)
+    }
+  } catch {
+    // no /tasks to ask (headless, refused, renamed): the old behavior
+    running = false
+  }
+  busyCache = { at: Date.now(), running }
+  return running
+}
+
+const classifyTasks = (text: string): boolean | undefined => {
+  const body = text.trim()
+  if (body === '' || /^\W*no\b.{0,20}\btasks?\b/i.test(body)) return false
+  if (/\brunning\b|in the background|waiting|monitor/i.test(body)) return true
+  return undefined
 }
 
 // out of the stack only once the box has it: a fill the box turned down (a
@@ -386,6 +478,10 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     const r = await next(e)
+    // nothing has run yet in this session: start trusted-idle so an early /q
+    // does not hang on a /tasks answer the classifier has never seen
+    stopAt = Date.now()
+    stopBlind = false
     await $.command
       .register({
         name: COMMAND,
@@ -400,6 +496,7 @@ export const register: Register = (on, options) => {
 
   on('turn.start', async ($, e, next) => {
     turnId = e.turnId
+    busyCache = null
     // the band reads the running turn: without this it keeps saying `sending`,
     // [ send ] and all, over the turn the queue itself started
     if (stack.length > 0) $.ui.invalidate('ui.render')
@@ -411,6 +508,7 @@ export const register: Register = (on, options) => {
     // a subagent's turn ends inside the session's own: not a moment to send
     if (e.agentId) return r
     turnId = undefined
+    busyCache = null
     if (drainedTurn === e.turnId) return r
     drainedTurn = e.turnId
     // the turn called no tool after all: what was pushed into it leads the drain
@@ -430,9 +528,30 @@ export const register: Register = (on, options) => {
   // classic Stop hook's input: the one place that says whether a turn's end
   // is the work's end. Stop runs before turn.complete.
   on('classic.Stop', async ($, e, next) => {
-    inFlight = e.background_tasks?.length ?? 0
+    const tasks = (e as { background_tasks?: unknown }).background_tasks
+    if (Array.isArray(tasks)) {
+      inFlight = tasks.length
+      stopBlind = false
+      stopAt = Date.now()
+    } else {
+      // silence is not an answer: keep the last count and let the gate probe
+      stopBlind = true
+    }
+    busyCache = null
     return next(e)
   })
+
+  // A background task just reported: the cached answer is stale, and the
+  // wake-turn's own end is what drains the stack. An early-access build
+  // without this event must not take the whole mod down with it.
+  try {
+    on('session.receive', async ($, e, next) => {
+      if ((e as { origin?: { kind?: string } }).origin?.kind === 'task-notification') busyCache = null
+      return next(e)
+    })
+  } catch {
+    // no task-notification signal on this build: caches still clear at turns
+  }
 
   // The steer route: a mid-turn message rides the next tool result's context,
   // which is how the engine delivers one. The object `next` gave us goes back
@@ -543,7 +662,7 @@ export const register: Register = (on, options) => {
     // our own count of the turn alone: `isWorking` reads false while a tool
     // runs under the fullscreen renderer, so it cannot clear `turnId`. Deferred
     // past this dispatch, from which a submit would be refused.
-    if (!turnId && inFlight === 0 && !e.props.isWorking && !pending && failures < RETRIES) pending = $.clock.after(0, () => flush($))
+    if (!turnId && inFlight === 0 && !e.props.isWorking && failures < RETRIES) armGate($)
     return bandOf($, e)
   })
 }
